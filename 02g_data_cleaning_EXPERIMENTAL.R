@@ -1,5 +1,5 @@
 
-# WORKFKLOW TO CLEAN DATA VIA KAMI PACKAGE AND EXPORT FOR SHIR APP INTEGRATION
+# WORKFKLOW TO CLEAN DATA VIA KAMI PACKAGE AND EXPORT FOR SHIR APP VISUALIZATION
 
 library(lubridate);library(metafor);library(tidyverse);library(amt);library(Hmisc)
 library(adehabitatHR); library(move2); library(epitools); library(suncalc); library(purrr); library(bit64)
@@ -7,21 +7,20 @@ library(mapview); library(move2utils)
 
 # --------------  CLEANING WITH KAMI PACKAGE ----------------
 
-# Read in subset of data that needs to be cleaned (119 tracks from both turkey vultures and wallabies)
+# Read in data that needs to be cleaned
 dataforcleaning <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_14 Data for Shir/Data_Shir_notcleaned/"
 dbpath          <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_12 Data from Anne/DATA/database/MoveTrait.v0.1_individual.sum_20260807.rds"
 
-# Load mass and mode lookup from database
-db <- readRDS(dbpath)
-mode_map <- c(fly = "flying", swim = "swimming", walk = "running", arboreal = "running")
-db$locomotion_mode <- mode_map[db$movement.mode]
-mass_lookup <- db[, c("study_id", "individual_id", "animal_mass", "locomotion_mode", "species", "common_name")]
+# Optional: load mass and mode instead of using the automatically inferred speed cap
+
 
 # Output folders
 outpath_move2        <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_14 Data for Shir/Data_Shir_cleaned/"
 pthamt1h_flagoutlier <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_14 Data for Shir/5.MB_indv_amt_1h_outlspeed/"
+outpath_autoplots    <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_20 Exploring the KAMI package/Data_Shir_cleaned_visualization_plots/auto_plots/"
 dir.create(outpath_move2,        showWarnings = FALSE)
 dir.create(pthamt1h_flagoutlier, showWarnings = FALSE)
+dir.create(outpath_autoplots,    showWarnings = FALSE, recursive = TRUE)
 
 # Load tracks
 fls <- list.files(dataforcleaning, pattern = "\\.rds$", full.names = FALSE)
@@ -32,6 +31,15 @@ data_list <- lapply(fls, function(f) {
 })
 names(data_list) <- tools::file_path_sans_ext(fls)
 
+# Load species lookup from the individual summary file received from Anne
+db             <- readRDS(dbpath)
+species_lookup <- unique(db[, c("study_id", "individual_id", "species", "common_name")])
+
+# Optional: also load mass and mode to use allometric speed cap instead of auto-inferred
+  # mode_map    <- c(fly = "flying", swim = "swimming", walk = "running", arboreal = "running")
+  # db$locomotion_mode <- mode_map[db$movement.mode]
+  # mass_lookup <- db[, c("study_id", "individual_id", "animal_mass", "locomotion_mode", "species", "common_name")]
+
 # Clean each track; save the mt_clean_track map to maps/ as a side effect
 keep_only_isoutlier_col <- TRUE
 core_cols <- c("x_", "y_", "t_", "burst_", "individual_local_identifier",
@@ -41,12 +49,18 @@ data_list_flagged <- lapply(names(data_list), function(nm) {
   trk      <- data_list[[nm]]
   ind_id   <- as.character(unique(trk[["individual_id"]]))
   study_id <- as.character(unique(trk[["study_id"]]))
-  meta     <- mass_lookup[mass_lookup$individual_id %in% ind_id, ]
-  if (nrow(meta) == 0) meta <- mass_lookup[mass_lookup$study_id %in% study_id, ]
-  mass        <- if (nrow(meta) > 0 && !is.na(meta$animal_mass[1])) meta$animal_mass[1] / 1000 else NULL
-  mode        <- if (!is.null(mass)) meta$locomotion_mode[1] else NULL
-  try(mt_clean_track(trk, mass = mass, mode = mode, remove = FALSE,
-                     consensus = "evidence_corroborated", plot = FALSE, silent = TRUE))
+  # meta     <- mass_lookup[mass_lookup$individual_id %in% ind_id, ]
+  # if (nrow(meta) == 0) meta <- mass_lookup[mass_lookup$study_id %in% study_id, ]
+  # mass        <- if (nrow(meta) > 0 && !is.na(meta$animal_mass[1])) meta$animal_mass[1] / 1000 else NULL
+  # mode        <- if (!is.null(mass)) meta$locomotion_mode[1] else NULL
+  sp_row      <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
+  sp_suffix   <- if (nrow(sp_row) > 0) paste0("_", gsub(" ", "_", tolower(sp_row$common_name[1]))) else ""
+  png(paste0(outpath_autoplots, nm, sp_suffix, "_autoplot.png"), width = 1600, height = 1200, res = 150)
+  result <- try(mt_clean_track(trk, remove = FALSE,
+                               consensus = "evidence_corroborated", plot = TRUE, silent = TRUE))
+  dev.off()
+  result
 })
 names(data_list_flagged) <- names(data_list)
 
@@ -69,8 +83,260 @@ lapply(names(data_list_flagged), function(nm) {
   saveRDS(df, file = paste0(pthamt1h_flagoutlier, nm, ".rds"))
 })
 
+# OPTIONAL STEPS FROM HERE ONWARDS
+
+# --------------  OPTIONAL: Outlier rate along track length ----------------
+
+track_summary <- do.call(rbind, lapply(names(data_list_flagged), function(nm) {
+  trk      <- data_list_flagged[[nm]]
+  if (inherits(trk, "try-error")) return(NULL)
+  ind_id   <- as.character(unique(trk[["individual_id"]]))
+  study_id <- as.character(unique(trk[["study_id"]]))
+  sp_row   <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
+  data.frame(
+    track       = nm,
+    species     = if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown species",
+    n_fixes     = nrow(trk),
+    n_outlier   = sum(trk$is_outlier, na.rm = TRUE),
+    pct_outlier = round(100 * mean(trk$is_outlier, na.rm = TRUE), 2)
+  )
+}))
+
+print(track_summary[order(-track_summary$pct_outlier), ])
+cat("Spearman correlation (n_fixes vs pct_outlier):",
+    round(cor(track_summary$n_fixes, track_summary$pct_outlier, method = "spearman"), 3), "\n")
+
+track_summary$animal_group <- ifelse(grepl("wallaby", track_summary$species, ignore.case = TRUE), "Wallaby", "Vulture")
+track_sorted <- track_summary[order(track_summary$n_fixes), ]
+track_sorted$rank <- seq_len(nrow(track_sorted))
+
+library(patchwork)
+
+p1 <- ggplot(track_sorted, aes(x = rank, y = pct_outlier, colour = animal_group)) +
+  geom_line(colour = "grey60", linewidth = 0.5) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_colour_manual(values = c("Vulture" = "#E69F00", "Wallaby" = "#0072B2")) +
+  labs(y = "Outlier (%)", x = NULL,
+       title = "Outlier rate along track length (shortest to longest)",
+       colour = "Species group") +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+
+p2 <- ggplot(track_sorted, aes(x = rank, y = n_fixes, colour = animal_group)) +
+  geom_line(colour = "grey60", linewidth = 0.5) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_colour_manual(values = c("Vulture" = "#E69F00", "Wallaby" = "#0072B2")) +
+  scale_y_log10(labels = scales::comma) +
+  labs(y = "Number of fixes (log)", x = "Tracks sorted from shortest to longest",
+       colour = "Species group") +
+  theme_bw()
+
+p1 / p2 + plot_layout(heights = c(2, 1), guides = "collect")
+
+# --------------  OPTIONAL: Compare auto speed cap vs mass/mode allometric cap ----------------
+
+mode_map    <- c(fly = "flying", swim = "swimming", walk = "running", arboreal = "running")
+db$locomotion_mode <- mode_map[db$movement.mode]
+mass_lookup <- db[, c("study_id", "individual_id", "animal_mass", "locomotion_mode", "species", "common_name")]
+
+data_list_flagged_massmode <- lapply(names(data_list), function(nm) {
+  trk      <- data_list[[nm]]
+  ind_id   <- as.character(unique(trk[["individual_id"]]))
+  study_id <- as.character(unique(trk[["study_id"]]))
+  meta     <- mass_lookup[mass_lookup$individual_id %in% ind_id, ]
+  if (nrow(meta) == 0) meta <- mass_lookup[mass_lookup$study_id %in% study_id, ]
+  mass     <- if (nrow(meta) > 0 && !is.na(meta$animal_mass[1])) meta$animal_mass[1] / 1000 else NULL
+  mode     <- if (!is.null(mass)) meta$locomotion_mode[1] else NULL
+  try(mt_clean_track(trk, mass = mass, mode = mode, remove = FALSE,
+                     consensus = "evidence_corroborated", plot = FALSE, silent = TRUE))
+})
+names(data_list_flagged_massmode) <- names(data_list)
+
+comparison_cap <- do.call(rbind, lapply(names(data_list), function(nm) {
+  trk_auto <- data_list_flagged[[nm]]
+  trk_mm   <- data_list_flagged_massmode[[nm]]
+  if (inherits(trk_auto, "try-error") || inherits(trk_mm, "try-error")) return(NULL)
+  ind_id   <- as.character(unique(trk_auto[["individual_id"]]))
+  study_id <- as.character(unique(trk_auto[["study_id"]]))
+  sp_row   <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
+  data.frame(
+    track        = nm,
+    species      = if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown",
+    n_fixes      = nrow(trk_auto),
+    pct_auto     = round(100 * mean(trk_auto$is_outlier, na.rm = TRUE), 2),
+    pct_massmode = round(100 * mean(trk_mm$is_outlier,   na.rm = TRUE), 2)
+  )
+}))
+
+comparison_cap$difference   <- comparison_cap$pct_massmode - comparison_cap$pct_auto
+comparison_cap$animal_group <- ifelse(grepl("wallaby", comparison_cap$species, ignore.case = TRUE), "Wallaby", "Vulture")
+
+total_fixes <- sum(comparison_cap$n_fixes)
+cat("Total outliers (auto cap):      ", round(sum(comparison_cap$pct_auto     * comparison_cap$n_fixes / 100)), "\n")
+cat("Total outliers (mass/mode cap): ", round(sum(comparison_cap$pct_massmode * comparison_cap$n_fixes / 100)), "\n")
+rate_auto    <- round(sum(comparison_cap$pct_auto     * comparison_cap$n_fixes / 100) / total_fixes * 100, 2)
+rate_massmode <- round(sum(comparison_cap$pct_massmode * comparison_cap$n_fixes / 100) / total_fixes * 100, 2)
+cat("Overall outlier rate (auto cap):     ", rate_auto,     "%\n")
+cat("Overall outlier rate (mass/mode cap):", rate_massmode, "%\n")
+cat("Overall reduction with auto cap:     ", round(rate_auto - rate_massmode, 2), "pp",
+    paste0("(", round((rate_massmode - rate_auto) / rate_massmode * 100), "% relative reduction)\n\n"))
+
+for (grp in c("Wallaby", "Vulture")) {
+  sub       <- comparison_cap[comparison_cap$animal_group == grp, ]
+  grp_fixes <- sum(sub$n_fixes)
+  r_auto    <- round(sum(sub$pct_auto     * sub$n_fixes / 100) / grp_fixes * 100, 2)
+  r_mm      <- round(sum(sub$pct_massmode * sub$n_fixes / 100) / grp_fixes * 100, 2)
+  cat(grp, "outlier rate (auto cap):     ", r_auto, "%\n")
+  cat(grp, "outlier rate (mass/mode cap):", r_mm,   "%\n")
+  cat(grp, "reduction with auto cap:     ", round(r_auto - r_mm, 2), "pp",
+      paste0("(", round((r_mm - r_auto) / r_mm * 100), "% relative reduction)\n\n"))
+}
+print(comparison_cap[order(-abs(comparison_cap$difference)), ])
+
+comparison_long <- tidyr::pivot_longer(comparison_cap,
+  cols      = c(pct_auto, pct_massmode),
+  names_to  = "method",
+  values_to = "pct_outlier"
+)
+comparison_long$method <- ifelse(comparison_long$method == "pct_auto", "Auto cap", "Mass/mode cap")
+comparison_cap$track   <- factor(comparison_cap$track, levels = comparison_cap$track[order(comparison_cap$difference)])
+
+print(
+  ggplot() +
+    geom_segment(data = comparison_cap,
+                 aes(x = pct_auto, xend = pct_massmode,
+                     y = track, yend = track, colour = animal_group), alpha = 0.5) +
+    geom_point(data = comparison_long,
+               aes(x = pct_outlier, y = track, shape = method, colour = animal_group), size = 2) +
+    scale_colour_manual(values = c("Vulture" = "#E69F00", "Wallaby" = "#0072B2")) +
+    facet_wrap(~animal_group, scales = "free_y") +
+    labs(x = "Outlier (%)", y = NULL,
+         title = "Outlier rate: auto speed cap vs mass/mode cap",
+         subtitle = "Tracks sorted by difference (auto minus mass/mode)",
+         colour = "Species group", shape = "Method") +
+    theme_bw() +
+    theme(axis.text.y = element_text(size = 6))
+)
+
+
+# --------------  OPTIONAL: Pooling ----------------
+
+# Thresholds are fitted on all tracks of the same species group (outer), then flags are
+# unioned back per individual track (inner = individual_local_identifier, which is the
+# column that move2 stores in track-level data). species_group must be added to track data
+# before passing to mt_clean_track.
+
+track_summary$animal_group <- ifelse(grepl("wallaby", track_summary$species, ignore.case = TRUE), "Wallaby", "Vulture")
+
+# Build individual_local_identifier -> species_group map
+species_group_map <- do.call(rbind, lapply(names(data_list), function(nm) {
+  fix_df  <- sf::st_drop_geometry(data_list[[nm]])
+  ind_id  <- as.character(unique(fix_df$individual_id))
+  sid     <- as.character(unique(fix_df$study_id))
+  sp_row  <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% sid, ]
+  sp_name <- if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown"
+  data.frame(
+    individual_local_identifier = as.character(unique(fix_df$individual_local_identifier)),
+    species_group = ifelse(grepl("wallaby", sp_name, ignore.case = TRUE), "Wallaby", "Vulture"),
+    stringsAsFactors = FALSE
+  )
+}))
+
+run_pooled <- function(track_nms) {
+  combined <- do.call(rbind, data_list[track_nms])
+  td       <- mt_track_data(combined)
+  td       <- merge(td, species_group_map, by = "individual_local_identifier", all.x = TRUE)
+  attr(combined, "track_data") <- td
+  tryCatch(
+    mt_clean_track(combined, pool_by = c("species_group", "individual_local_identifier"),
+                   remove = FALSE, plot = FALSE, silent = TRUE),
+    error = function(e) { message("Pooled run error: ", e$message); NULL }
+  )
+}
+
+wallaby_nms    <- track_summary$track[track_summary$animal_group == "Wallaby" & track_summary$n_fixes >= 10]
+vulture_nms    <- track_summary$track[track_summary$animal_group == "Vulture" & track_summary$n_fixes >= 10]
+wallaby_pooled <- run_pooled(wallaby_nms)
+vulture_pooled <- run_pooled(vulture_nms)
+
+compare_pooling <- function(pooled_obj, track_nms, label) {
+  do.call(rbind, lapply(track_nms, function(nm) {
+    fix_df       <- sf::st_drop_geometry(data_list[[nm]])
+    ind_loc_id   <- as.character(unique(fix_df$individual_local_identifier))
+    pooled_trk   <- pooled_obj[pooled_obj[["individual_local_identifier"]] %in% ind_loc_id, ]
+    unpooled_trk <- data_list_flagged[[nm]]
+    data.frame(
+      track                = nm,
+      group                = label,
+      n_fixes              = nrow(data_list[[nm]]),
+      pct_outlier_unpooled = round(100 * mean(unpooled_trk$is_outlier, na.rm = TRUE), 2),
+      pct_outlier_pooled   = round(100 * mean(pooled_trk$is_outlier,   na.rm = TRUE), 2)
+    )
+  }))
+}
+
+pooling_comparison <- rbind(
+  compare_pooling(wallaby_pooled, wallaby_nms, "Wallaby"),
+  compare_pooling(vulture_pooled, vulture_nms, "Vulture")
+)
+pooling_comparison$difference <- pooling_comparison$pct_outlier_pooled - pooling_comparison$pct_outlier_unpooled
+print(pooling_comparison[order(-abs(pooling_comparison$difference)), ])
+
+# Save pooling comparison table and diagnostic plots for affected tracks
+outpath_pooling <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/Pooling/"
+dir.create(outpath_pooling, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(pooling_comparison[order(-abs(pooling_comparison$difference)), ],
+          paste0(outpath_pooling, "pooling_comparison_wallaby.csv"), row.names = FALSE)
+message("Saved: pooling_comparison_wallaby.csv")
+
+# Diagnostic plots for tracks where pooling increased outlier detection
+affected_tracks <- pooling_comparison$track[pooling_comparison$difference > 0 & pooling_comparison$group == "Wallaby"]
+
+# Unpooled auto plots for the 10 affected tracks (one PNG each)
+for (nm in affected_tracks) {
+  png(paste0(outpath_pooling, nm, "_unpooled_autoplot.png"), width = 1600, height = 1200, res = 150)
+  tryCatch(
+    mt_clean_track(data_list[[nm]], remove = FALSE,
+                   consensus = "evidence_corroborated", plot = TRUE, silent = TRUE),
+    error = function(e) message("Unpooled plot error (", nm, "): ", e$message)
+  )
+  dev.off()
+  message("Saved unpooled: ", nm)
+}
+
+# Pooled auto plots: %03d pattern creates one numbered PNG per individual automatically
+wallaby_combined_plot <- do.call(rbind, data_list[wallaby_nms])
+td_plot <- mt_track_data(wallaby_combined_plot)
+td_plot <- merge(td_plot, species_group_map, by = "individual_local_identifier", all.x = TRUE)
+attr(wallaby_combined_plot, "track_data") <- td_plot
+
+png(paste0(outpath_pooling, "pooled_tmp_%03d.png"), width = 1600, height = 1200, res = 150)
+tryCatch(
+  mt_clean_track(wallaby_combined_plot,
+                 pool_by = c("species_group", "individual_local_identifier"),
+                 remove = FALSE, plot = TRUE, silent = TRUE),
+  error = function(e) message("Pooled plot error: ", e$message)
+)
+dev.off()
+
+# Rename affected tracks to meaningful names, delete the rest
+for (i in seq_along(wallaby_nms)) {
+  tmp <- sprintf("%spooled_tmp_%03d.png", outpath_pooling, i)
+  if (!file.exists(tmp)) next
+  nm <- wallaby_nms[i]
+  if (nm %in% affected_tracks) {
+    file.rename(tmp, paste0(outpath_pooling, nm, "_pooled_autoplot.png"))
+    message("Saved pooled: ", nm)
+  } else {
+    file.remove(tmp)
+  }
+}
+
 # --------------  OPTIONAL: Save maps ----------------
-# Self-contained — run independently after cleaning, no need to re-run the cleaning section.
 
 library(move2); library(move2utils); library(sf); library(bit64)
 
@@ -81,8 +347,12 @@ dir.create(.outpath_maps, recursive = TRUE, showWarnings = FALSE)
 lapply(list.files(.outpath_move2, full.names = TRUE, pattern = "\\.rds$"), function(f) {
   trk         <- readRDS(f)
   nm          <- tools::file_path_sans_ext(basename(f))
-  common_name <- if (startsWith(nm, "481458_")) "Turkey Vulture" else if (startsWith(nm, "268904527_")) "Wallaby" else "unknown species"
-  suffix      <- if (startsWith(nm, "481458_")) "_turkey_vulture" else if (startsWith(nm, "268904527_")) "_wallaby" else ""
+  study_id    <- as.character(unique(trk[["study_id"]]))
+  ind_id      <- as.character(unique(trk[["individual_id"]]))
+  sp_row      <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
+  common_name <- if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown species"
+  suffix      <- if (nrow(sp_row) > 0) paste0("_", gsub(" ", "_", tolower(common_name))) else ""
 
   cc      <- sf::st_coordinates(trk)
   flagged <- which(trk$is_outlier)
@@ -104,7 +374,6 @@ lapply(list.files(.outpath_move2, full.names = TRUE, pattern = "\\.rds$"), funct
 })
 
 # --------------  OPTIONAL: Save diagnostic plots ----------------
-# Self-contained — run independently after cleaning, no need to re-run the cleaning section.
 
 library(move2); library(move2utils); library(sf); library(bit64)
 
@@ -115,7 +384,11 @@ dir.create(.outpath_diag, recursive = TRUE, showWarnings = FALSE)
 lapply(list.files(.outpath_move2, full.names = TRUE, pattern = "\\.rds$"), function(f) {
   trk         <- readRDS(f)
   nm          <- tools::file_path_sans_ext(basename(f))
-  common_name <- if (startsWith(nm, "481458_")) "Turkey Vulture" else if (startsWith(nm, "268904527_")) "Wallaby" else "unknown species"
+  study_id    <- as.character(unique(trk[["study_id"]]))
+  ind_id      <- as.character(unique(trk[["individual_id"]]))
+  sp_row      <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
+  common_name <- if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown species"
 
   png(paste0(.outpath_diag, nm, ".png"), width = 3200, height = 2000, res = 150)
   par(oma = c(0, 0, 3, 0))
@@ -125,7 +398,6 @@ lapply(list.files(.outpath_move2, full.names = TRUE, pattern = "\\.rds$"), funct
 })
 
 # -------------- OPTIONAL: Save species-level diagnostic summary (one PDF per species) ----------------
-# Self-contained — run independently after cleaning, no need to re-run the cleaning section.
 
 library(move2); library(move2utils); library(sf); library(bit64)
 
@@ -135,11 +407,19 @@ dir.create(.outpath_diag, recursive = TRUE, showWarnings = FALSE)
 
 fls_all <- list.files(.outpath_move2, full.names = TRUE, pattern = "\\.rds$")
 
-species_prefix <- list("Turkey Vulture" = "481458_", "Wallaby" = "268904527_")
+get_common_name <- function(f) {
+  trk     <- readRDS(f)
+  study_id <- as.character(unique(trk[["study_id"]]))
+  ind_id   <- as.character(unique(trk[["individual_id"]]))
+  sp_row   <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
+  if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown species"
+}
 
-for (species_name in names(species_prefix)) {
-  prefix        <- species_prefix[[species_name]]
-  species_files <- fls_all[startsWith(basename(fls_all), prefix)]
+species_groups <- split(fls_all, sapply(fls_all, get_common_name))
+
+for (species_name in names(species_groups)) {
+  species_files <- species_groups[[species_name]]
   if (length(species_files) == 0) next
 
   pdf(paste0(.outpath_diag, gsub(" ", "_", species_name), "_all_diagnostics.pdf"),
