@@ -7,6 +7,8 @@ library(mapview); library(move2utils)
 
 # --------------  CLEANING WITH KAMI PACKAGE ----------------
 
+# UNPOOLED AND V_MAX
+
 # Read in data that needs to be cleaned
 dataforcleaning <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_14 Data for Shir/Data_Shir_notcleaned/"
 dbpath          <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_12 Data from Anne/DATA/database/MoveTrait.v0.1_individual.sum_20260807.rds"
@@ -15,11 +17,11 @@ dbpath          <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_12
 
 
 # Output folders
-outpath_move2        <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_14 Data for Shir/Data_Shir_cleaned/"
-pthamt1h_flagoutlier <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_14 Data for Shir/5.MB_indv_amt_1h_outlspeed/"
-outpath_autoplots    <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_08_20 Exploring the KAMI package/Data_Shir_cleaned_visualization_plots/auto_plots/"
-dir.create(outpath_move2,        showWarnings = FALSE)
-dir.create(pthamt1h_flagoutlier, showWarnings = FALSE)
+outpath_move2        <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/03_Tracks/Unpooled/RDS files/"
+pthamt1h_flagoutlier <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/03_Tracks/Unpooled/AMT objects/"
+outpath_autoplots    <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/04_Plots/Unpooled/"
+dir.create(outpath_move2,        showWarnings = FALSE, recursive = TRUE)
+dir.create(pthamt1h_flagoutlier, showWarnings = FALSE, recursive = TRUE)
 dir.create(outpath_autoplots,    showWarnings = FALSE, recursive = TRUE)
 
 # Load tracks
@@ -55,8 +57,10 @@ data_list_flagged <- lapply(names(data_list), function(nm) {
   # mode        <- if (!is.null(mass)) meta$locomotion_mode[1] else NULL
   sp_row      <- species_lookup[species_lookup$individual_id %in% ind_id, ]
   if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
-  sp_suffix   <- if (nrow(sp_row) > 0) paste0("_", gsub(" ", "_", tolower(sp_row$common_name[1]))) else ""
-  png(paste0(outpath_autoplots, nm, sp_suffix, "_autoplot.png"), width = 1600, height = 1200, res = 150)
+  ind_from_file <- strsplit(nm, "_")[[1]][2]
+  sp_name       <- if (nrow(sp_row) > 0) gsub(" ", "_", tolower(sp_row$common_name[1])) else "unknown"
+  plot_nm       <- paste0(study_id[1], "_", ind_from_file, "_", sp_name, "_unpooled_autoplot.png")
+  png(paste0(outpath_autoplots, plot_nm), width = 1600, height = 1200, res = 150)
   result <- try(mt_clean_track(trk, remove = FALSE,
                                consensus = "evidence_corroborated", plot = TRUE, silent = TRUE))
   dev.off()
@@ -71,17 +75,171 @@ if (any(failed)) message("Failed tracks: ", paste(names(data_list_flagged)[faile
 lapply(names(data_list_flagged), function(nm) {
   trk <- data_list_flagged[[nm]]
   if (inherits(trk, "try-error")) return(NULL)
+  study_id <- as.character(unique(trk[["study_id"]]))[1]
+  ind_id   <- as.character(unique(trk[["individual_id"]]))[1]
+  file_nm  <- paste0(study_id, "_", ind_id, "_cleaned.rds")
 
   # Full move2 object
-  saveRDS(trk, paste0(outpath_move2, nm, "_KAMI.rds"))
+  saveRDS(trk, paste0(outpath_move2, file_nm))
 
   # amt object (core columns + is_outlier)
   df <- sf::st_drop_geometry(trk)
   df$is_outlier <- ifelse(df$is_outlier, "yes", "no")
   if (keep_only_isoutlier_col) df <- select(df, all_of(core_cols))
   df <- structure(df, class = c("track_xyt", "track_xy", "tbl_df", "tbl", "data.frame"))
-  saveRDS(df, file = paste0(pthamt1h_flagoutlier, nm, ".rds"))
+  saveRDS(df, file = paste0(pthamt1h_flagoutlier, file_nm))
 })
+
+
+# POOLED
+
+# Thresholds are fitted on all tracks of the same species group (outer), then flags are
+# unioned back per individual track (inner = individual_local_identifier, which is the
+# column that move2 stores in track-level data). species_group must be added to track data
+# before passing to mt_clean_track.
+
+track_summary <- do.call(rbind, lapply(names(data_list_flagged), function(nm) {
+  trk      <- data_list_flagged[[nm]]
+  if (inherits(trk, "try-error")) return(NULL)
+  ind_id   <- as.character(unique(trk[["individual_id"]]))
+  study_id <- as.character(unique(trk[["study_id"]]))
+  sp_row   <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
+  data.frame(
+    track       = nm,
+    species     = if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown species",
+    n_fixes     = nrow(trk),
+    n_outlier   = sum(trk$is_outlier, na.rm = TRUE),
+    pct_outlier = round(100 * mean(trk$is_outlier, na.rm = TRUE), 2)
+  )
+}))
+
+track_summary$animal_group <- ifelse(grepl("wallaby", track_summary$species, ignore.case = TRUE), "Wallaby", "Vulture")
+
+# Build individual_local_identifier -> species_group map
+species_group_map <- do.call(rbind, lapply(names(data_list), function(nm) {
+  fix_df  <- sf::st_drop_geometry(data_list[[nm]])
+  ind_id  <- as.character(unique(fix_df$individual_id))
+  sid     <- as.character(unique(fix_df$study_id))
+  sp_row  <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% sid, ]
+  sp_name <- if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown"
+  data.frame(
+    individual_local_identifier = as.character(unique(fix_df$individual_local_identifier)),
+    species_group = ifelse(grepl("wallaby", sp_name, ignore.case = TRUE), "Wallaby", "Vulture"),
+    stringsAsFactors = FALSE
+  )
+}))
+
+run_pooled <- function(track_nms) {
+  combined <- do.call(rbind, data_list[track_nms])
+  td       <- mt_track_data(combined)
+  td       <- merge(td, species_group_map, by = "individual_local_identifier", all.x = TRUE)
+  attr(combined, "track_data") <- td
+  result <- tryCatch(
+    mt_clean_track(combined, pool_by = c("species_group", "individual_local_identifier"),
+                   remove = FALSE, plot = FALSE, silent = TRUE),
+    error = function(e) { message("Pooled run error: ", e$message); NULL }
+  )
+  if (is.null(result)) return(NULL)
+  # Split immediately into per-individual list so the large combined object can be freed
+  out <- lapply(track_nms, function(nm) {
+    ind_loc_id <- as.character(unique(sf::st_drop_geometry(data_list[[nm]])$individual_local_identifier))
+    result[result[["individual_local_identifier"]] %in% ind_loc_id, ]
+  })
+  setNames(out, track_nms)
+}
+
+save_pooled_plots <- function(pooled_list, track_nms) {
+  for (nm in track_nms) {
+    trk      <- pooled_list[[nm]]
+    fix_df   <- sf::st_drop_geometry(data_list[[nm]])
+    study_id <- as.character(unique(fix_df$study_id)[1])
+    ind_id   <- as.character(unique(fix_df$individual_id))
+    ind_from_file <- strsplit(nm, "_")[[1]][2]
+    sp_row   <- species_lookup[species_lookup$individual_id %in% ind_id, ]
+    if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% study_id, ]
+    sp_name  <- if (nrow(sp_row) > 0) gsub(" ", "_", tolower(sp_row$common_name[1])) else "unknown"
+    plot_nm  <- paste0(study_id, "_", ind_from_file, "_", sp_name, "_pooled_autoplot.png")
+    png(paste0(outpath_pooling_plots, plot_nm), width = 1600, height = 1200, res = 150)
+    tryCatch(
+      mt_diagnose_clean_track(trk, silent = TRUE),
+      error = function(e) message("Plot error (", nm, "): ", e$message)
+    )
+    dev.off()
+    message("Saved pooled plot: ", plot_nm)
+  }
+}
+
+outpath_pooling_plots <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/04_Plots/Pooled/"
+dir.create(outpath_pooling_plots, recursive = TRUE, showWarnings = FALSE)
+
+wallaby_nms    <- track_summary$track[track_summary$animal_group == "Wallaby" & track_summary$n_fixes >= 10]
+vulture_nms    <- track_summary$track[track_summary$animal_group == "Vulture" & track_summary$n_fixes >= 10]
+wallaby_pooled <- run_pooled(wallaby_nms)
+vulture_pooled <- run_pooled(vulture_nms)
+
+compare_pooling <- function(pooled_list, track_nms, label) {
+  do.call(rbind, lapply(track_nms, function(nm) {
+    pooled_trk   <- pooled_list[[nm]]
+    unpooled_trk <- data_list_flagged[[nm]]
+    data.frame(
+      track                = nm,
+      group                = label,
+      n_fixes              = nrow(data_list[[nm]]),
+      pct_outlier_unpooled = round(100 * mean(unpooled_trk$is_outlier, na.rm = TRUE), 2),
+      pct_outlier_pooled   = round(100 * mean(pooled_trk$is_outlier,   na.rm = TRUE), 2)
+    )
+  }))
+}
+
+pooling_comparison <- rbind(
+  compare_pooling(wallaby_pooled, wallaby_nms, "Wallaby"),
+  compare_pooling(vulture_pooled, vulture_nms, "Vulture")
+)
+pooling_comparison$difference <- pooling_comparison$pct_outlier_pooled - pooling_comparison$pct_outlier_unpooled
+print(pooling_comparison[order(-abs(pooling_comparison$difference)), ])
+
+# Save pooling comparison table and pooled RDS/AMT files
+outpath_docs        <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/02_Documentation/"
+outpath_pooled_rds  <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/03_Tracks/Pooled/RDS files/"
+outpath_pooled_amt  <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/03_Tracks/Pooled/AMT objects/"
+dir.create(outpath_docs,       recursive = TRUE, showWarnings = FALSE)
+dir.create(outpath_pooled_rds, recursive = TRUE, showWarnings = FALSE)
+dir.create(outpath_pooled_amt, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(pooling_comparison[order(-abs(pooling_comparison$difference)), ],
+          paste0(outpath_docs, "pooled_unpooled_comparison.csv"), row.names = FALSE)
+message("Saved: pooled_unpooled_comparison.csv")
+
+# Save each individual's pooled move2 and AMT objects
+save_pooled <- function(pooled_list, track_nms) {
+  for (nm in track_nms) {
+    trk_pooled <- pooled_list[[nm]]
+    fix_df     <- sf::st_drop_geometry(data_list[[nm]])
+    study_id   <- as.character(unique(fix_df$study_id))[1]
+    ind_id     <- as.character(unique(fix_df$individual_id))[1]
+    file_nm    <- paste0(study_id, "_", ind_id, "_cleaned.rds")
+    saveRDS(trk_pooled, paste0(outpath_pooled_rds, file_nm))
+    message("Saved pooled RDS: ", file_nm)
+    df <- sf::st_drop_geometry(trk_pooled)
+    df$is_outlier <- ifelse(df$is_outlier, "yes", "no")
+    if (keep_only_isoutlier_col) df <- select(df, all_of(core_cols))
+    df <- structure(df, class = c("track_xyt", "track_xy", "tbl_df", "tbl", "data.frame"))
+    saveRDS(df, paste0(outpath_pooled_amt, file_nm))
+    message("Saved pooled AMT: ", file_nm)
+  }
+}
+
+save_pooled(wallaby_pooled, wallaby_nms)
+save_pooled(vulture_pooled, vulture_nms)
+
+
+# --------------  OPTIONAL: Pooled autoplots (slow — runs mt_clean_track per individual) ----------------
+
+save_pooled_plots(wallaby_pooled, wallaby_nms)
+save_pooled_plots(vulture_pooled, vulture_nms)
+
 
 # OPTIONAL STEPS FROM HERE ONWARDS
 
@@ -220,121 +378,6 @@ print(
     theme(axis.text.y = element_text(size = 6))
 )
 
-
-# --------------  OPTIONAL: Pooling ----------------
-
-# Thresholds are fitted on all tracks of the same species group (outer), then flags are
-# unioned back per individual track (inner = individual_local_identifier, which is the
-# column that move2 stores in track-level data). species_group must be added to track data
-# before passing to mt_clean_track.
-
-track_summary$animal_group <- ifelse(grepl("wallaby", track_summary$species, ignore.case = TRUE), "Wallaby", "Vulture")
-
-# Build individual_local_identifier -> species_group map
-species_group_map <- do.call(rbind, lapply(names(data_list), function(nm) {
-  fix_df  <- sf::st_drop_geometry(data_list[[nm]])
-  ind_id  <- as.character(unique(fix_df$individual_id))
-  sid     <- as.character(unique(fix_df$study_id))
-  sp_row  <- species_lookup[species_lookup$individual_id %in% ind_id, ]
-  if (nrow(sp_row) == 0) sp_row <- species_lookup[species_lookup$study_id %in% sid, ]
-  sp_name <- if (nrow(sp_row) > 0) sp_row$common_name[1] else "unknown"
-  data.frame(
-    individual_local_identifier = as.character(unique(fix_df$individual_local_identifier)),
-    species_group = ifelse(grepl("wallaby", sp_name, ignore.case = TRUE), "Wallaby", "Vulture"),
-    stringsAsFactors = FALSE
-  )
-}))
-
-run_pooled <- function(track_nms) {
-  combined <- do.call(rbind, data_list[track_nms])
-  td       <- mt_track_data(combined)
-  td       <- merge(td, species_group_map, by = "individual_local_identifier", all.x = TRUE)
-  attr(combined, "track_data") <- td
-  tryCatch(
-    mt_clean_track(combined, pool_by = c("species_group", "individual_local_identifier"),
-                   remove = FALSE, plot = FALSE, silent = TRUE),
-    error = function(e) { message("Pooled run error: ", e$message); NULL }
-  )
-}
-
-wallaby_nms    <- track_summary$track[track_summary$animal_group == "Wallaby" & track_summary$n_fixes >= 10]
-vulture_nms    <- track_summary$track[track_summary$animal_group == "Vulture" & track_summary$n_fixes >= 10]
-wallaby_pooled <- run_pooled(wallaby_nms)
-vulture_pooled <- run_pooled(vulture_nms)
-
-compare_pooling <- function(pooled_obj, track_nms, label) {
-  do.call(rbind, lapply(track_nms, function(nm) {
-    fix_df       <- sf::st_drop_geometry(data_list[[nm]])
-    ind_loc_id   <- as.character(unique(fix_df$individual_local_identifier))
-    pooled_trk   <- pooled_obj[pooled_obj[["individual_local_identifier"]] %in% ind_loc_id, ]
-    unpooled_trk <- data_list_flagged[[nm]]
-    data.frame(
-      track                = nm,
-      group                = label,
-      n_fixes              = nrow(data_list[[nm]]),
-      pct_outlier_unpooled = round(100 * mean(unpooled_trk$is_outlier, na.rm = TRUE), 2),
-      pct_outlier_pooled   = round(100 * mean(pooled_trk$is_outlier,   na.rm = TRUE), 2)
-    )
-  }))
-}
-
-pooling_comparison <- rbind(
-  compare_pooling(wallaby_pooled, wallaby_nms, "Wallaby"),
-  compare_pooling(vulture_pooled, vulture_nms, "Vulture")
-)
-pooling_comparison$difference <- pooling_comparison$pct_outlier_pooled - pooling_comparison$pct_outlier_unpooled
-print(pooling_comparison[order(-abs(pooling_comparison$difference)), ])
-
-# Save pooling comparison table and diagnostic plots for affected tracks
-outpath_pooling <- "/Users/sofiawagner/Desktop/CleaningRoutines_Sofia/2026_09_14 Advancing with the KAMI package/Pooling/"
-dir.create(outpath_pooling, recursive = TRUE, showWarnings = FALSE)
-
-write.csv(pooling_comparison[order(-abs(pooling_comparison$difference)), ],
-          paste0(outpath_pooling, "pooling_comparison_wallaby.csv"), row.names = FALSE)
-message("Saved: pooling_comparison_wallaby.csv")
-
-# Diagnostic plots for tracks where pooling increased outlier detection
-affected_tracks <- pooling_comparison$track[pooling_comparison$difference > 0 & pooling_comparison$group == "Wallaby"]
-
-# Unpooled auto plots for the 10 affected tracks (one PNG each)
-for (nm in affected_tracks) {
-  png(paste0(outpath_pooling, nm, "_unpooled_autoplot.png"), width = 1600, height = 1200, res = 150)
-  tryCatch(
-    mt_clean_track(data_list[[nm]], remove = FALSE,
-                   consensus = "evidence_corroborated", plot = TRUE, silent = TRUE),
-    error = function(e) message("Unpooled plot error (", nm, "): ", e$message)
-  )
-  dev.off()
-  message("Saved unpooled: ", nm)
-}
-
-# Pooled auto plots: %03d pattern creates one numbered PNG per individual automatically
-wallaby_combined_plot <- do.call(rbind, data_list[wallaby_nms])
-td_plot <- mt_track_data(wallaby_combined_plot)
-td_plot <- merge(td_plot, species_group_map, by = "individual_local_identifier", all.x = TRUE)
-attr(wallaby_combined_plot, "track_data") <- td_plot
-
-png(paste0(outpath_pooling, "pooled_tmp_%03d.png"), width = 1600, height = 1200, res = 150)
-tryCatch(
-  mt_clean_track(wallaby_combined_plot,
-                 pool_by = c("species_group", "individual_local_identifier"),
-                 remove = FALSE, plot = TRUE, silent = TRUE),
-  error = function(e) message("Pooled plot error: ", e$message)
-)
-dev.off()
-
-# Rename affected tracks to meaningful names, delete the rest
-for (i in seq_along(wallaby_nms)) {
-  tmp <- sprintf("%spooled_tmp_%03d.png", outpath_pooling, i)
-  if (!file.exists(tmp)) next
-  nm <- wallaby_nms[i]
-  if (nm %in% affected_tracks) {
-    file.rename(tmp, paste0(outpath_pooling, nm, "_pooled_autoplot.png"))
-    message("Saved pooled: ", nm)
-  } else {
-    file.remove(tmp)
-  }
-}
 
 # --------------  OPTIONAL: Save maps ----------------
 
